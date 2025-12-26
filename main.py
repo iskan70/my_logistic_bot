@@ -6,7 +6,7 @@ import logging
 import platform
 import sqlite3  # Чтобы не было ошибки NameError: sqlite3
 from datetime import datetime
-
+import json
 import gspread
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -56,7 +56,6 @@ def get_country_kb():
     builder.adjust(2) # Кнопки по две в ряд
     return builder.as_markup()
 
-import json
 from oauth2client.service_account import ServiceAccountCredentials
 
 async def save_to_google_sheets(row):
