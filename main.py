@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-
 import asyncio
 import os
 import re
 import logging
 import platform
+import sqlite3  # Чтобы не было ошибки NameError: sqlite3
 from datetime import datetime
 
 import gspread
@@ -31,6 +31,7 @@ from aiogram.client.default import DefaultBotProperties
 
 # === 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ ===
 load_dotenv()
+
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -40,13 +41,12 @@ bot = Bot(token=os.getenv("BOT_TOKEN"), default=DefaultBotProperties(parse_mode=
 dp = Dispatcher(storage=MemoryStorage())
 client_ai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "").strip())
 SHEET_ID = os.getenv("SHEET_ID")
+ADMIN_IDS = [494255577]
 
-# === 1.1 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+# --- 1.1 ФУНКЦИЯ ДЛЯ GOOGLE ТАБЛИЦ ---
 async def save_to_google_sheets(row_data: list):
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        
-        # Собираем ключ из списка строк, чтобы Python точно не потерял переносы \n
         key_lines = [
             "-----BEGIN PRIVATE KEY-----",
             "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCod+3adi2TAque",
@@ -78,7 +78,6 @@ async def save_to_google_sheets(row_data: list):
             "-----END PRIVATE KEY-----"
         ]
         formatted_key = "\n".join(key_lines)
-
         service_account_info = {
             "type": "service_account",
             "project_id": "telegram-bots-482313",
@@ -91,47 +90,64 @@ async def save_to_google_sheets(row_data: list):
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/logistic-bot-manager%40telegram-bots-482313.iam.gserviceaccount.com"
         }
-
         creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
         client = gspread.authorize(creds)
-        
-        sheet_id = os.getenv("SHEET_ID").strip()
-        sheet = client.open_by_key(sheet_id).get_worksheet(0)
-        
+        sheet = client.open_by_key(SHEET_ID.strip()).get_worksheet(0)
         sheet.append_row(row_data)
         print("✅ УСПЕХ: Запись в таблице!")
         return True
-        
     except Exception as e:
-        # Теперь он точно напишет причину, даже если она внутри данных
         import traceback
-        print(f"❌ КОНКРЕТНАЯ ПРИЧИНА: {e}")
-        print(traceback.format_exc()) # Это покажет, на какой строке сбой
+        print(f"❌ ОШИБКА ТАБЛИЦЫ: {e}")
+        print(traceback.format_exc())
         return False
+
+# --- 1.2 ЛОКАЛЬНАЯ БАЗА ДАННЫХ ---
+def init_db():
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+        (user_id INTEGER PRIMARY KEY, username TEXT, role TEXT, status TEXT, last_seen DATETIME, last_geo TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def update_user_db(user_id, username, role=None, status=None, geo=None):
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute('''INSERT INTO users (user_id, username, role, status, last_seen, last_geo) 
+        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET 
+        username=excluded.username, role=COALESCE(excluded.role, users.role), 
+        status=excluded.status, last_seen=excluded.last_seen,
+        last_geo=COALESCE(excluded.last_geo, users.last_geo)''',
+        (user_id, username, role, status, datetime.now(), geo))
+    conn.commit()
+    conn.close()
+
 
 # === 2. МАШИНА СОСТОЯНИЙ (FSM) - ИСПРАВЛЕННАЯ ===
 
 class OrderFlow(StatesGroup):
     """Состояния для оформления перевозки и анализа документов"""
-    fio = State()                 # Добавлено для шага 1
-    phone = State()               # Добавлено для шага 2
+    fio = State()                 # Шаг 1
+    phone = State()               # Шаг 2
     cargo_type = State()          # Что везем
     cargo_value = State()         # Стоимость груза
-    origin = State()              # Город отправления (вместо route_origin)
-    destination = State()         # Город назначения (вместо route_destination)
-    weight = State()              # Вес (вместо cargo_weight_value)
-    volume = State()              # Объем (вместо cargo_volume_value)
-    
-    # Резервные состояния (если понадобятся позже)
-    selecting_role = State()
-    selecting_transport = State()
-    confirm_data = State()
-    
-    # Состояние для ИИ-анализа (чтобы не было AttributeError)
-    waiting_for_doc_analysis = State() 
+    origin = State()              # Город отправления
+    destination = State()         # Город назначения
+    weight = State()              # Вес
+    volume = State()              # Объем
+    waiting_for_weight = State()
+    waiting_for_doc_analysis = State() # ТЕПЕРЬ СТРОКА 521 БУДЕТ РАБОТАТЬ
+    confirm_data = State()        # Подтверждение данных
+
+class Broadcast(StatesGroup):
+    """Состояния для рассылки водителям"""
+    waiting_for_text = State()
 
 class AdminPanel(StatesGroup):
-    """Состояния для рассылки админа"""
+    """Состояния для админ-панели"""
     broadcast_message = State()
 
 class CustomsCalc(StatesGroup):
@@ -141,36 +157,34 @@ class CustomsCalc(StatesGroup):
     manual_duty = State()         # Подшаг: Ручной ввод %
     cargo_price = State()         # Шаг 3: Ввод цены
     select_region = State()       # Шаг 4: Выбор НДС (РФ/РК)
-    
-    # Старые поля для совместимости, если используются
     val_input = State()
     duty_input = State()
 
+# Вспомогательные состояния для ролей
+class RoleSelection(StatesGroup):
+    selecting_role = State()
+    selecting_transport = State()
+
 # === 3. ГЕНЕРАТОРЫ КЛАВИАТУР ===
-def get_main_kb():
+def get_main_kb(user_id: int):
+    # Проверяем роль в базе данных
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    role = row[0] if row else "Клиент"
+    conn.close()
+
     btns = [
         [KeyboardButton(text="🚛 Оформить перевозку"), KeyboardButton(text="🛡 Таможня")],
         [KeyboardButton(text="📄 Анализ документов"), KeyboardButton(text="👨‍💼 Менеджер")]
     ]
+    
+    # Кнопку видят только админы и те, у кого в базе роль 'Водитель'
+    if user_id in ADMIN_IDS or role == "Водитель":
+        btns.append([KeyboardButton(text="🚀 Начать рейс (Включить GPS)", request_location=True)])
+        
     return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
-
-def get_country_kb():
-    """Клавиатура с флагами и кодами стран"""
-    btns = [
-        [KeyboardButton(text="🇰🇿 +7 (KZ)"), KeyboardButton(text="🇷🇺 +7 (RU)")],
-        [KeyboardButton(text="🇵🇱 +48 (PL)"), KeyboardButton(text="🇹🇷 +90 (TR)")],
-        [KeyboardButton(text="🇨🇳 +86 (CN)"), KeyboardButton(text="🇺🇿 +998")],
-        [KeyboardButton(text="🇧🇾 +375"), KeyboardButton(text="🇰🇬 +996")],
-        [KeyboardButton(text="⌨️ Другой код"), KeyboardButton(text="📱 Мой номер", request_contact=True)]
-    ]
-    return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True, one_time_keyboard=True)
-
-def get_region_kb():
-    btns = [
-        [InlineKeyboardButton(text="🇰🇿 Казахстан (НДС 16%)", callback_data="vat_16")],
-        [InlineKeyboardButton(text="🇷🇺 Россия (НДС 22%)", callback_data="vat_22")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=btns)
 
 # === 4. ОБРАБОТКА КОМАНДЫ /START ===
 
@@ -178,11 +192,13 @@ def get_region_kb():
 async def cmd_start(m: Message, state: FSMContext):
     """
     Запуск бота. 
-    Используется строго согласованный текст приветствия.
     """
     await state.clear()
     
-    # Ваше персональное приветствие
+    # Регистрация пользователя в базе
+    update_user_db(m.from_user.id, m.from_user.username, status="В главном меню")
+    
+    # Текст приветствия
     welcome_text = (
         f"🤝 Здравствуйте, {m.from_user.first_name}!\n\n"
         f"Вас приветствует логист компании Logistics Manager.\n\n"
@@ -191,10 +207,28 @@ async def cmd_start(m: Message, state: FSMContext):
         f"• Рассчитать стоимость международной доставки\n"
         f"• Проверить коммерческие документы (AI-анализ)\n"
         f"• Оценить таможенные пошлины и налоги\n\n"
-        f"Воспользуйтесь меню ниже для начала работы 👇 или напишите в сообщении что именно вас интересует"
+        f"Воспользуйтесь меню ниже для начала работы 👇"
     )
     
-    await m.answer(welcome_text, reply_markup=get_main_kb())
+    # Важно: передаем m.from_user.id в генератор клавиатуры!
+    await m.answer(welcome_text, reply_markup=get_main_kb(m.from_user.id))
+
+# === 4.1 СЕКРЕТНАЯ РЕГИСТРАЦИЯ ВОДИТЕЛЯ ===
+@dp.message(Command("driver_2025")) # Команда, которую вы дадите водителю
+async def cmd_driver_reg(m: Message):
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    # Устанавливаем роль 'Водитель'
+    cursor.execute("UPDATE users SET role='Водитель' WHERE user_id=?", (m.from_user.id,))
+    conn.commit()
+    conn.close()
+    
+    await m.answer(
+        "✅ <b>Доступ водителя активирован!</b>\n"
+        "Теперь в вашем меню появилась кнопка включения GPS.",
+        reply_markup=get_main_kb(m.from_user.id), # Сразу обновляем меню
+        parse_mode="HTML"
+    )
 
 # === 5. ЛОГИКА ОФОРМЛЕНИЯ ПЕРЕВОЗКИ ===
 
@@ -557,37 +591,386 @@ async def company_geography(m: Message):
     )
     await m.answer(text, reply_markup=get_main_kb())
 
-# === 9. АДМИН-ПАНЕЛЬ (ТОЛЬКО ДЛЯ ВАС) ===
+# === 9. ОБНОВЛЕННАЯ АДМИН-ПАНЕЛЬ (СТАТИСТИКА, ВОДИТЕЛИ, РАССЫЛКА) ===
 
-ADMIN_IDS = [12345678, 87654321]  # Замените на ваши ID (можно узнать через @userinfobot)
+ADMIN_IDS = [494255577]  # Ваш ID
 
 @dp.message(Command("admin"))
 async def admin_panel(m: Message):
     """Вход в админку"""
     if m.from_user.id not in ADMIN_IDS:
-        return # Игнорируем не-админов
+        return 
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика заявок", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📢 Рассылка пользователям", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="🔗 Ссылка на Google Таблицу", url=f"https://docs.google.com/spreadsheets/d/{SHEET_ID}")]
+        [InlineKeyboardButton(text="📈 Детальная статистика", callback_data="stats_users")],
+        [InlineKeyboardButton(text="📂 Скачать базу клиентов", callback_data="download_base")], # ДОБАВИЛИ ЭТУ СТРОКУ
+        [InlineKeyboardButton(text="🚛 Мониторинг водителей", callback_data="stats_drivers")],
+        [InlineKeyboardButton(text="📢 Рассылка водителям", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔗 Открыть Google Таблицу", url=f"https://docs.google.com/spreadsheets/d/{os.getenv('SHEET_ID')}")]
     ])
     
-    await m.answer("🛠 <b>Панель администратора</b>\nВыберите действие:", reply_markup=kb)
+    await m.answer("🛠 <b>Панель администратора</b>\nВыберите нужный раздел:", reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(cb: CallbackQuery):
-    """Краткая сводка из таблиц (пример)"""
-    # Здесь можно добавить логику подсчета строк в gspread
-    await cb.message.answer("📊 В базе данных зафиксировано более 150 заявок за месяц.")
+# --- 1. ОБРАБОТКА ДЕТАЛЬНОЙ СТАТИСТИКИ ---
+@dp.callback_query(F.data == "stats_users")
+async def cb_admin_stats(cb: CallbackQuery):
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    
+    # Считаем общее количество уникальных пользователей
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total = cursor.fetchone()[0]
+    
+    # Берем 10 последних активных пользователей (даже без /start, если они попали в базу при заказе)
+    cursor.execute('''
+        SELECT username, role, status, last_seen 
+        FROM users 
+        ORDER BY last_seen DESC 
+        LIMIT 10
+    ''')
+    recent_users = cursor.fetchall()
+    conn.close()
+
+    res = f"📊 <b>ОТЧЕТ ПО ПОЛЬЗОВАТЕЛЯМ</b>\n"
+    res += f"Всего в базе: <b>{total}</b> чел.\n"
+    res += f"__________________________\n\n"
+    res += f"🕒 <b>Последняя активность:</b>\n"
+    
+    if recent_users:
+        for u in recent_users:
+            uname = f"@{u[0]}" if u[0] else "ID (скрыт)"
+            role = u[1] if u[1] else "Клиент"
+            status = u[2] if u[2] else "В процессе"
+            # Форматируем время для читаемости
+            time = u[3].split('.')[0] if u[3] else "Неизвестно"
+            
+            res += f"👤 <b>{uname}</b> (<i>{role}</i>)\n"
+            res += f"└ 📍 Статус: {status}\n"
+            res += f"└ 🕒 {time}\n\n"
+    else:
+        res += "База данных пока пуста."
+    
+    await cb.message.answer(res, parse_mode="HTML")
     await cb.answer()
 
-@dp.message(Command("broadcast"))
-async def admin_broadcast_start(m: Message, state: FSMContext):
-    """Начало создания рассылки"""
+# --- 2. МОНИТОРИНГ ВОДИТЕЛЕЙ ---
+
+# Обработчик нажатия кнопки "СТАТИСТИКА ВОДИТЕЛЕЙ" в админ-панели
+@dp.callback_query(F.data == "stats_drivers")
+async def cb_admin_drivers(cb: CallbackQuery):
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    # Проверяем и создаем колонки, если их нет
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN car_number TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN route TEXT")
+    except: pass
+
+    cursor.execute("SELECT username, last_geo, last_seen, car_number, route FROM users WHERE role='Водитель'")
+    drivers = cursor.fetchall()
+    conn.close()
+
+    res = "🚛 <b>ТЕКУЩАЯ ДИСЛОКАЦИЯ</b>\n\n"
+    if not drivers:
+        res += "Водителей с активным GPS не найдено."
+    else:
+        for d in drivers:
+            username = f"@{d[0]}" if d[0] else "ID (скрыт)"
+            car = f"🚗 <code>{d[3]}</code>" if d[3] else "🚗 Без номера"
+            route = f"🛣 {d[4]}" if d[4] else "🛣 Маршрут не указан"
+            
+            if d[1] and "," in d[1]:
+                map_url = f"https://www.google.com/maps?q={d[1]}"
+                res += f"👤 <b>{username}</b> | {car}\n{route}\n"
+                res += f"📍 <a href='{map_url}'>Посмотреть на карте</a>\n"
+                res += f"🕒 Обновлено: {d[2]}\n\n"
+            else:
+                res += f"👤 <b>{username}</b> | {car}\n📍 GPS выключен\n\n"
+    
+    await cb.message.answer(res, parse_mode="HTML", disable_web_page_preview=True)
+    await cb.answer()
+
+# АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ (когда водитель просто едет с включенным Live Location)
+@dp.edited_message(F.location)
+async def handle_live_location(message: Message):
+    user_id = message.from_user.id
+    lat, lon = message.location.latitude, message.location.longitude
+    geo_string = f"{lat},{lon}"
+    now = datetime.now()
+    now_str = now.strftime("%d.%m.%Y %H:%M")
+
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    # Авто-создание колонок
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_google_update TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN car_number TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN route TEXT")
+    except: pass
+
+    cursor.execute("SELECT username, car_number, route, last_google_update FROM users WHERE user_id = ?", (user_id,))
+    u_data = cursor.fetchone()
+    if not u_data: 
+        conn.close()
+        return
+
+    username, car_num, route, last_upd = u_data
+    
+    # Проверка таймера: 3 часа (10800 сек)
+    should_google = False
+    if last_upd:
+        try:
+            last_dt = datetime.strptime(last_upd, "%d.%m.%Y %H:%M")
+            if (now - last_dt).total_seconds() >= 10800: should_google = True
+        except: should_google = True
+    else: should_google = True
+
+    # Обновляем SQLite (всегда сохраняем последнюю точку)
+    cursor.execute("UPDATE users SET last_geo=?, last_seen=? WHERE user_id=?", (geo_string, now_str, user_id))
+    
+    # Пишем в Google Sheets (раз в 3 часа)
+    if should_google:
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+            creds = Credentials.from_service_account_file("creds.json", scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            client = gspread.authorize(creds)
+            sheet = client.open_by_key(os.getenv('SHEET_ID')).worksheet("мониторинг водителей")
+            
+            map_url = f"https://www.google.com/maps?q={geo_string}"
+            sheet.append_row([
+                f"@{username}" if username else f"ID:{user_id}", 
+                car_num or "-", 
+                route or "-", 
+                now_str, 
+                geo_string, 
+                map_url, 
+                "🚚 В пути"
+            ])
+            
+            cursor.execute("UPDATE users SET last_google_update=? WHERE user_id=?", (now_str, user_id))
+        except Exception as e: 
+            print(f"GS-Error (Auto): {e}")
+
+    conn.commit()
+    conn.close()
+
+# РУЧНОЕ НАЧАЛО РЕЙСА (когда водитель отправляет геопозицию кнопкой)
+@dp.message(F.location)
+async def handle_manual_location(message: Message):
+    user_id = message.from_user.id
+    geo_string = f"{message.location.latitude},{message.location.longitude}"
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    map_url = f"https://www.google.com/maps?q={geo_string}"
+
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    # Гарантируем наличие колонок в базе
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN car_number TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN route TEXT")
+    except: pass
+
+    cursor.execute("SELECT username, car_number, route FROM users WHERE user_id=?", (user_id,))
+    u = cursor.fetchone()
+    
+    # Обновляем локальную базу
+    cursor.execute("UPDATE users SET last_geo=?, last_seen=? WHERE user_id=?", (geo_string, now_str, user_id))
+    conn.commit()
+    conn.close()
+
+    username = f"@{u[0]}" if u and u[0] else message.from_user.full_name
+    car = u[1] if u and u[1] else "Не указан"
+    route = u[2] if u and u[2] else "Не указан"
+
+    # Уведомление всем администраторам
+    for adm in ADMIN_IDS:
+        try: 
+            await bot.send_message(adm, f"🚀 <b>РЕЙС ЗАПУЩЕН</b>\n👤 {username}\n🚗 {car}\n🛣 {route}\n📍 <a href='{map_url}'>Посмотреть карту</a>", parse_mode="HTML")
+        except: pass
+
+    # Запись в Google Таблицу (статус "Начал рейс")
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_file("creds.json", scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(os.getenv('SHEET_ID')).worksheet("мониторинг водителей")
+        sheet.append_row([username, car, route, now_str, geo_string, map_url, "🚀 Начал рейс"])
+    except Exception as e: 
+        print(f"GS-Error (Manual): {e}")
+
+    await message.answer(f"✅ <b>Рейс активирован!</b>\nМаршрут: {route}\nВаш GPS транслируется диспетчеру.\n\n(Для автоматического обновления не забудьте включить 'Транслировать мою геопозицию')", parse_mode="HTML")
+
+# --- 3. РАССЫЛКА ДЛЯ ВОДИТЕЛЕЙ С ПОВТОРОМ ---
+
+class Broadcast(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_retry = State()
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def cb_broadcast_start(cb: CallbackQuery, state: FSMContext):
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role='Водитель'")
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    if count == 0:
+        await cb.message.answer("❌ <b>В базе нет водителей.</b>\nИспользуйте <code>/driver_2025</code> для регистрации.")
+        return await cb.answer()
+
+    await cb.message.answer(f"📢 <b>Рассылка для {count} водителей.</b>\nВведите текст сообщения:")
+    await state.set_state(Broadcast.waiting_for_text)
+    await cb.answer()
+
+@dp.message(Broadcast.waiting_for_text)
+async def process_broadcast_text(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    
+    text_to_send = message.text
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username FROM users WHERE role='Водитель'")
+    drivers = cursor.fetchall()
+    conn.close()
+
+    success = 0
+    failed_ids = []
+
+    status_msg = await message.answer("🚀 <i>Рассылаю...</i>")
+
+    for d_id, d_name in drivers:
+        try:
+            full_text = f"⚠️ <b>ОПОВЕЩЕНИЕ ЛОГИСТА:</b>\n\n{text_to_send}"
+            await bot.send_message(d_id, full_text, parse_mode="HTML")
+            success += 1
+        except Exception:
+            failed_ids.append(str(d_id))
+
+    kb = InlineKeyboardBuilder()
+    if failed_ids:
+        await state.update_data(retry_ids=failed_ids, retry_text=text_to_send)
+        kb.row(InlineKeyboardButton(text="🔄 Повторить для недошедших", callback_data="broadcast_retry"))
+    
+    kb.row(InlineKeyboardButton(text="✅ Закрыть", callback_data="delete_msg"))
+
+    res_text = (
+        f"🏁 <b>Результаты рассылки:</b>\n"
+        f"✅ Доставлено: <b>{success}</b>\n"
+        f"❌ Ошибки (не в сети): <b>{len(failed_ids)}</b>"
+    )
+    
+    await status_msg.edit_text(res_text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    if not failed_ids:
+        await state.clear()
+
+@dp.callback_query(F.data == "broadcast_retry")
+async def cb_broadcast_retry(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    retry_ids = data.get("retry_ids", [])
+    text = data.get("retry_text", "")
+
+    if not retry_ids:
+        return await cb.answer("Больше некому переотправлять.")
+
+    await cb.message.edit_text(f"🔄 <i>Повторная попытка для {len(retry_ids)} чел...</i>")
+    
+    still_failed = []
+    success = 0
+
+    for u_id in retry_ids:
+        try:
+            await bot.send_message(int(u_id), f"⚠️ <b>ПОВТОРНОЕ ОПОВЕЩЕНИЕ:</b>\n\n{text}", parse_mode="HTML")
+            success += 1
+        except Exception:
+            still_failed.append(u_id)
+
+    if still_failed:
+        await state.update_data(retry_ids=still_failed)
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="broadcast_retry"))
+        kb.row(InlineKeyboardButton(text="❌ Отмена", callback_data="delete_msg"))
+        await cb.message.edit_text(f"🏁 <b>Итог повтора:</b>\n✅ Успешно: {success}\n❌ Всё еще не в сети: {len(still_failed)}", 
+                                   reply_markup=kb.as_markup())
+    else:
+        await cb.message.edit_text(f"✅ <b>Все сообщения успешно доставлены!</b>")
+        await state.clear()
+    await cb.answer()
+
+@dp.callback_query(F.data == "delete_msg")
+async def cb_delete(cb: CallbackQuery):
+    await cb.message.delete()
+    await cb.answer()
+
+# --- 4. DEMO для маркетинга ---
+@dp.message(Command("demo"))
+async def cmd_demo(m: Message):
     if m.from_user.id not in ADMIN_IDS: return
-    await m.answer("Введите текст сообщения для рассылки всем пользователям:")
-    # Здесь нужна логика сохранения всех user_id в БД для рассылки
+
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    # Колонки: Тип услуги, Дата, Имя, Телефон, Груз, Инвойс, Пункт отпр, Пункт назн, Вес, Объем, Детали
+    demo_payload = [
+        "Авто-доставка (Демо)", # Тип услуги
+        now,                    # Дата и время
+        m.from_user.full_name,  # Имя
+        "+7 999 000-00-00",     # Телефон (тестовый)
+        "Запчасти",             # Груз
+        "5000 USD",             # Инвойс
+        "Урумчи (Китай)",       # Пункт отправления
+        "Гданьск (Польша)",     # Пункт назначения
+        "150 кг",               # Вес
+        "0.5 м³",               # Объем
+        "ТЕСТОВЫЙ ЗАКАЗ ДЛЯ ДЕМО" # Детали
+    ]
+
+    msg = await m.answer("⏳ <b>Запуск демо-заказа...</b>")
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        # Исправлено название файла на creds.json по вашему запросу
+        creds = Credentials.from_service_account_file("creds.json", scopes=scopes)
+        client = gspread.authorize(creds)
+
+        sheet_id = os.getenv('SHEET_ID')
+        sheet = client.open_by_key(sheet_id).sheet1 
+        sheet.append_row(demo_payload) 
+        
+        await msg.edit_text(
+            f"✅ <b>Заказ успешно создан!</b>\n\n"
+            f"📍 Маршрут: {demo_payload[6]} -> {demo_payload[7]}\n"
+            f"📊 Данные распределены по вашим {len(demo_payload)} колонкам.\n"
+            f"🚀 Срок 18 дней подтвержден.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+# === ДОПОЛНИТЕЛЬНО: КНОПКА СКАЧАТЬ БАЗУ ===
+@dp.callback_query(F.data == "download_base")
+async def cb_download_base(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS: return
+    
+    # Создаем текстовый файл со всеми клиентами
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, status FROM users")
+    users = cursor.fetchall()
+    conn.close()
+    
+    with open("users_base.txt", "w", encoding="utf-8") as f:
+        f.write("ID | USERNAME | STATUS\n")
+        for u in users:
+            f.write(f"{u[0]} | @{u[1]} | {u[2]}\n")
+    
+    # Отправляем файл админу
+    from aiogram.types import FSInputFile
+    file = FSInputFile("users_base.txt")
+    await cb.message.answer_document(file, caption="📂 Полная база клиентов для продажи.")
+    await cb.answer()
 
 # === 10. ФИНАЛЬНЫЙ ЗАПУСК И AI-КОНСУЛЬТАНТ ===
 
@@ -636,3 +1019,48 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот остановлен.")
+
+# --- ФИНАЛЬНЫЙ БЛОК ЗАПУСКА (ВСТАВИТЬ В САМЫЙ КОНЕЦ ФАЙЛА) ---
+
+async def main():
+    # Эта часть создает нужные колонки в базе данных при запуске
+    conn = sqlite3.connect('logistics.db')
+    cursor = conn.cursor()
+    
+    # Создаем таблицу, если её нет
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            role TEXT DEFAULT 'Клиент',
+            car_number TEXT,
+            route TEXT,
+            last_geo TEXT,
+            last_seen TEXT,
+            last_google_update TEXT
+        )
+    ''')
+    
+    # ПРИНУДИТЕЛЬНО добавляем недостающие колонки в уже существующую базу
+    columns = [
+        ("car_number", "TEXT"),
+        ("route", "TEXT"),
+        ("last_google_update", "TEXT")
+    ]
+    
+    for col_name, col_type in columns:
+        try:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+        except:
+            pass # Если колонка уже есть, код просто пойдет дальше
+            
+    conn.commit()
+    conn.close()
+
+    # Запуск самого бота
+    print("🚀 Система готова. База данных проверена.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
