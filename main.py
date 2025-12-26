@@ -277,7 +277,27 @@ async def order_fio(m: Message, state: FSMContext):
     await state.update_data(fio=m.text)
     await state.set_state(OrderFlow.phone)
     await m.answer("📱 Выберите код страны или введите номер полностью (+...):", reply_markup=get_country_kb())
+    
+@dp.callback_query(F.data.startswith("country_"))
+async def cb_country_select(cb: CallbackQuery, state: FSMContext):
+    # 1. Извлекаем код страны
+    country_code = cb.data.split("_")[1]
+    
+    # 2. Определяем, сколько цифр ждать (digits_map)
+    digits_map = {"+86": 11, "+7": 10, "+375": 9, "+998": 9, "+996": 9, "+49": 11, "+48": 9}
+    needed = digits_map.get(country_code, 10)
+    
+    # 3. СОХРАНЯЕМ И КОД, И КОЛИЧЕСТВО ЦИФР (Важнейший момент!)
+    await state.update_data(temp_code=country_code, needed_digits=needed)
+    
+    await cb.answer()
+    
+    await cb.message.answer(
+        f"✅ Выбрана страна с кодом <b>{country_code}</b>\n"
+        f"Введите оставшиеся <b>{needed}</b> цифр номера (без кода страны):",
+        parse_mode="HTML"
 
+    )
 @dp.message(OrderFlow.phone)
 async def order_phone(m: Message, state: FSMContext):
     """Шаг 3: Валидация телефона"""
@@ -376,7 +396,7 @@ async def order_finish(m: Message, state: FSMContext):
     if success:
         await m.answer(
             "🚀 <b>Заявка принята!</b>\n\nНаши специалисты свяжутся с вами в ближайшее время.", 
-            reply_markup=get_main_kb()
+            reply_markup=get_main_kb(m.from_user.id)
         )
     else:
         # Даже если таблица дала сбой, не пугаем клиента
