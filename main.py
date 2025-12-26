@@ -48,58 +48,24 @@ ADMIN_IDS = [494255577]
 # --- 1.1 ФУНКЦИЯ ДЛЯ GOOGLE ТАБЛИЦ (ИСПРАВЛЕННАЯ) ---
 async def save_to_google_sheets(row_data: list):
     try:
-        # Приоритет переменной окружения GOOGLE_CREDS_JSON для Render
+        # 1. Берем данные ТОЛЬКО из переменной Render
         creds_json = os.getenv("GOOGLE_CREDS_JSON")
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        
-        if creds_json:
-            info = json.loads(creds_json)
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-        else:
-            # Если переменной нет, используем встроенный ключ (как запасной вариант)
-            key_lines = [
-                "-----BEGIN PRIVATE KEY-----",
-                "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCod+3adi2TAque",
-                "y1SCyV6iQ/m7/NIhZWKjw+DWqVt5ktr1p0ldtxS/plFZkURAY9vi5+s5JDJ2QfJn",
-                "TmM0IONnBLS7y0/R7BNDW/yUNJ7dMNoG1JBs9TcZN52jk/Ljsc85R/eEPas7EAiC",
-                "KVzRX+WJKQCuXzXw5BmEL24JWLolenOOwBRS4B+p9DipSTn8pWQCNqeYaKBKX8Eh",
-                "NZQANhfHdHCvvDN0+9+HYNivTY378aTrDtMh8LQ7SnmqFcCt0dO8xAUBciou5KwI",
-                "6otF2NtLdzg7btUspeCj2ZSon+VG6yNG7d9uG/2HdyZY3KLzgrsHHHaqNnXHvQuS",
-                "IwxcOPItAgMBAAECggEAEducn/K1BAddb9i33aFA4cx41X+IOrgHi7qAw+Bx7OIv",
-                "Sajw8vksPuB/cRIf/P9Y2KWi3ozCuJxm+KJri6QM1ue9zMZRcLwokpRWotMtH99E",
-                "zUKNCK+5pnepwyQ0tAQuJjFFwIPU+c7KSBngV+VlbHOnOdSn4CAdwFBSxrTcDorO",
-                "9aMLNif23c3buFuD0QZGKc1kQHY6Eow8P+a/GUTom8h0Cmdt4cgJEUgaFc16uF31",
-                "i8fABxlcLGHnrd4hD/guDlcBZaVkzwHjKEyO7Up9psRnVWf31dC/XlM/CS2uSMoY",
-                "iUvSE8/eONv+7PuzUZC/MKkydIjjLGWvbToYQvZ2AQKBgQDtmeUAH9NBtxvFXWZ9",
-                "EAeZzHhXZb5iedZBRVR9nzFeiIUtfrjIx6CVtoLKMoF7o+8nxE7PJhY9i/HVD2NU",
-                "XUud2VoB62vdOoOJs495eGdLozMpItgs7fwVK+Kbhjee84laE2ME1Sc/oL2e51OK",
-                "UPbEIUreWFiXmQfxO+aHlv7NgQKBgQC1g5PQ1FaRKSxW6eRHf7hQthKy44eLpqnm",
-                "ANcjRquM0MlQIZexPO3Pro2sGa9+SM1j/fuJPZSMXMxjUE2Q50U+A1x19jGL1/Et",
-                "KRvc2p7jqrIqE9xLrzhJ5liTofUGvcrCxmDUpCka4o12wEMITOdmPqafg/h8E3rs",
-                "Kp+EjBUSrQKBgQDKyiGQlJkbKmxSbCAwN4E1PDWt6lGu/Ovn84NkYH2jgIOiS9js",
-                "zKz7erVwW+D1pPpWh4738DrlNs8lmKefdq02QS84GjWKsQlZet7GvwPyo4zj3DCD",
-                "UG9ppnYXZVuNl7AwKAHIOyDvhoKw4CEGGYoz5XJgCSk74knME+Ly8OXygQKBgQCy",
-                "42sxm6N5Sre9LKPjZ1dyjA6fqSg0FNxKprdgt8xoaniM9Z53edHyJVjQrTvM3Nk3",
-                "W9+j4UHel7KDimf3kEYomM1uIGWyKe8yD9q67ec7/0W5vHsXSCfUhST00uAWdcQ3",
-                "86UIzIUKTw8WYuNtccV4efRjL4AcYGJ8EIHH8vrtvQKBgFM6e3qWhokNRvekC43V",
-                "UjeO6upUlAynHRXWutsgeYsmqdPKhzQxtEhhZ3gYDctXax1Jj7waH9j4OuKnfTT6",
-                "Zn7jj36YZFy4vC8N5PadsvUe9k2StW5chzIcZ9OFJxL7FtVhfpVc9tyWYikoD+uW",
-                "2T9nyXdgK5AaJOwH0DBPNoYO",
-                "-----END PRIVATE KEY-----"
-            ]
-            formatted_key = "\n".join(key_lines)
-            info = {
-                "type": "service_account",
-                "project_id": "telegram-bots-482313",
-                "private_key": formatted_key,
-                "client_email": "logistic-bot-manager@telegram-bots-482313.iam.gserviceaccount.com"
-            }
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
 
+        if not creds_json:
+            logging.error("❌ ОШИБКА: Переменная GOOGLE_CREDS_JSON не задана в настройках Render!")
+            return False
+
+        # 2. Авторизуемся через полученный JSON
+        info = json.loads(creds_json)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
         client = gspread.authorize(creds)
+
+        # 3. Записываем данные
         sheet = client.open_by_key(SHEET_ID.strip()).get_worksheet(0)
         sheet.append_row(row_data)
         return True
+
     except Exception as e:
         logging.error(f"❌ ОШИБКА ТАБЛИЦЫ: {e}")
         return False
