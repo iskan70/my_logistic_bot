@@ -170,6 +170,10 @@ def get_main_kb(user_id: int):
     # Проверяем роль в базе данных
     conn = sqlite3.connect('logistics.db')
     cursor = conn.cursor()
+    
+    # СТРАХОВКА: Создаем таблицу, если Render её удалил после деплоя
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, role TEXT DEFAULT 'Клиент')")
+    
     cursor.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
     role = row[0] if row else "Клиент"
@@ -180,8 +184,9 @@ def get_main_kb(user_id: int):
         [KeyboardButton(text="📄 Анализ документов"), KeyboardButton(text="👨‍💼 Менеджер")]
     ]
     
-    # Кнопку видят только админы и те, у кого в базе роль 'Водитель'
+    # Кнопку видят админы и Водители
     if user_id in ADMIN_IDS or role == "Водитель":
+        # Важно: request_location=True позволяет одним нажатием отправить координаты
         btns.append([KeyboardButton(text="🚀 Начать рейс (Включить GPS)", request_location=True)])
         
     return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
