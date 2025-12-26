@@ -55,7 +55,35 @@ def get_country_kb():
     
     builder.adjust(2) # Кнопки по две в ряд
     return builder.as_markup()
-    
+
+import json
+from oauth2client.service_account import ServiceAccountCredentials
+
+async def save_to_google_sheets(row):
+    try:
+        # 1. Получаем ключи из переменной Render (переименуй creds.json в GOOGLE_CREDS_JSON на Render!)
+        creds_json = os.getenv("GOOGLE_CREDS_JSON")
+        if not creds_json:
+            print(">>> ОШИБКА: На Render не настроена переменная GOOGLE_CREDS_JSON")
+            return False
+
+        # 2. Авторизация
+        info = json.loads(creds_json)
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+        client = gspread.authorize(creds)
+
+        # 3. Открываем таблицу по ID из настроек Render
+        sheet_id = os.getenv("SHEET_ID")
+        sheet = client.open_by_key(sheet_id).get_worksheet(0)
+
+        # 4. Запись данных
+        sheet.append_row(row)
+        print(">>> УСПЕХ: Данные в таблице!")
+        return True
+    except Exception as e:
+        print(f">>> ОШИБКА GOOGLE: {e}")
+        return False
 # === 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ ===
 load_dotenv()
 
