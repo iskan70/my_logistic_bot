@@ -280,33 +280,29 @@ async def order_fio(m: Message, state: FSMContext):
     
 @dp.callback_query(F.data.startswith("country_"))
 async def cb_country_select(cb: CallbackQuery, state: FSMContext):
-    # 1. Извлекаем код страны
+    """Обработка выбора страны из инлайн-кнопок"""
     country_code = cb.data.split("_")[1]
-    
-    # 2. Определяем, сколько цифр ждать (digits_map)
     digits_map = {"+86": 11, "+7": 10, "+375": 9, "+998": 9, "+996": 9, "+49": 11, "+48": 9}
     needed = digits_map.get(country_code, 10)
     
-    # 3. СОХРАНЯЕМ И КОД, И КОЛИЧЕСТВО ЦИФР (Важнейший момент!)
     await state.update_data(temp_code=country_code, needed_digits=needed)
-    
     await cb.answer()
-    
     await cb.message.answer(
         f"✅ Выбрана страна с кодом <b>{country_code}</b>\n"
         f"Введите оставшиеся <b>{needed}</b> цифр номера (без кода страны):",
         parse_mode="HTML"
-
     )
+
 @dp.message(OrderFlow.phone)
 async def order_phone(m: Message, state: FSMContext):
     """Шаг 3: Валидация телефона"""
     digits_map = {"+7": 10, "+48": 9, "+90": 10, "+86": 11, "+998": 9, "+375": 9, "+996": 9}
     text = m.text.strip() if m.text else ""
 
+    # Если ввели руками с кодом в скобках (на всякий случай)
     if "(" in text and "+" in text:
         code = re.search(r'\+\d+', text).group()
-        needed = digits_map.get(code)
+        needed = digits_map.get(code, 10)
         await state.update_data(temp_code=code, needed_digits=needed)
         return await m.answer(f"Вы выбрали {code}. Введите ровно <b>{needed}</b> цифр номера:")
 
@@ -373,25 +369,30 @@ async def order_finish(m: Message, state: FSMContext):
     await state.update_data(volume=m.text)
     d = await state.get_data()
     
+    # Визуальный отклик в боте
     await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+    await m.answer("⏳ Сохраняю вашу заявку...")
     
     # Формируем список строго под вашу шапку (11 колонок)
     row = [
         "ЗАКАЗ",                                     # Тип услуги
         datetime.now().strftime("%d.%m.%Y %H:%M"),   # Дата и время
-        d.get('fio'),                                # Имя
-        d.get('phone'),                              # Телефон
-        d.get('cargo_type'),                         # Груз
-        d.get('cargo_value'),                        # Инвойс (стоимость товара)
-        d.get('org'),                                # Пункт отправления
-        d.get('dst'),                                # Пункт назначения
-        d.get('weight'),                             # Вес
-        d.get('volume'),                             # Объем
+        d.get('fio', '-'),                           # Имя
+        d.get('phone', '-'),                         # Телефон
+        d.get('cargo_type', '-'),                   # Груз
+        d.get('cargo_value', '-'),                  # Инвойс
+        d.get('org', '-'),                           # Откуда
+        d.get('dst', '-'),                           # Куда
+        d.get('weight', '-'),                        # Вес
+        d.get('volume', '-'),                        # Объем
         "-"                                          # Детали
     ]
     
-    # Вызов общей функции сохранения
-    success = await save_to_google_sheets(row)
+    # Пытаемся сохранить (если функция save_to_google_sheets асинхронная)
+    try:
+        success = await save_to_google_sheets(row)
+    except Exception:
+        success = False
     
     if success:
         await m.answer(
@@ -399,8 +400,11 @@ async def order_finish(m: Message, state: FSMContext):
             reply_markup=get_main_kb(m.from_user.id)
         )
     else:
-        # Даже если таблица дала сбой, не пугаем клиента
-        await m.answer("✅ Заявка сохранена в системе! Специалист свяжется с вами.", reply_markup=get_main_kb())
+        # План Б: если таблица недоступна
+        await m.answer(
+            "✅ Заявка сохранена в системе! Специалист свяжется с вами.", 
+            reply_markup=get_main_kb(m.from_user.id)
+        )
     
     await state.clear()
 
