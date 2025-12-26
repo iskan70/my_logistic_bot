@@ -127,16 +127,21 @@ def get_country_kb():
 # =========================================================
 # 5. КОМАНДЫ (START, ADMIN, DRIVER, DEMO)
 # =========================================================
+
 @dp.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     
     # Регистрация или обновление пользователя в БД
     conn = sqlite3.connect('logistics.db')
+    # Используем INSERT OR IGNORE, чтобы не было ошибок, если колонки status еще нет
     conn.execute(
-        "INSERT INTO users (user_id, username, last_seen, status) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen, status=excluded.status",
-        (m.from_user.id, m.from_user.username, datetime.now().strftime("%d.%m.%Y %H:%M"), "Главное меню")
+        "INSERT OR IGNORE INTO users (user_id, username, last_seen) VALUES (?, ?, ?)",
+        (m.from_user.id, m.from_user.username, datetime.now().strftime("%d.%m.%Y %H:%M"))
+    )
+    conn.execute(
+        "UPDATE users SET last_seen=?, username=? WHERE user_id=?",
+        (datetime.now().strftime("%d.%m.%Y %H:%M"), m.from_user.username, m.from_user.id)
     )
     conn.commit()
     conn.close()
@@ -154,12 +159,54 @@ async def cmd_start(m: Message, state: FSMContext):
     
     await m.answer(welcome_text, reply_markup=get_main_kb(m.from_user.id))
 
+@dp.message(Command("admin"))
+async def cmd_admin(m: Message):
+    """Команда вызова панели управления (только для ADMIN_IDS)"""
+    if m.from_user.id not in ADMIN_IDS:
+        # Если не админ — просто игнорируем или пускаем в AI-чат
+        return 
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Статистика базы", callback_data="stats_users")],
+        [InlineKeyboardButton(text="📋 Тест системы (/demo)", callback_data="run_demo_fast")]
+    ])
+    await m.answer("🛠 <b>Панель администратора Logistics Manager</b>", reply_markup=kb)
+
 @dp.message(Command("demo"))
 async def cmd_demo(m: Message):
+    """Глубокая диагностика 2-х инструментов: Заявки + GPS Мониторинг"""
     if m.from_user.id not in ADMIN_IDS: return
+
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    row = ["ДЕМО", now, m.from_user.full_name, "+7(000)", "Тест", "100$", "Китай", "Европа", "1кг", "1м3", "OK"]
-    if await save_to_google_sheets(row): await m.answer("✅ Тест 11 колонок в Google Sheets пройден!")
+    status_msg = await m.answer("⚙️ <b>Запуск комплексной диагностики...</b>")
+    
+    # 1. Проверка таблицы заявок (11 колонок)
+    order_payload = [
+        "🤖 ТЕСТ_ЗАЯВКА", now, m.from_user.full_name, "+7(999)000-00-00", 
+        "Запчасти", "5000 USD", "Шанхай", "Мюнхен", "50 кг", "0.3 м³", "Проверка связи"
+    ]
+    
+    # 2. Проверка таблицы мониторинга (7 колонок)
+    geo_payload = [
+        f"Тест-Водитель ({m.from_user.first_name})", "TEST-777", "Пекин -> Варшава", 
+        now, "39.9042,116.4074", "http://maps.google.com/?q=39.9042,116.4074", "🛠 ДИАГНОСТИКА"
+    ]
+
+    await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+
+    success_order = await save_to_google_sheets(order_payload)
+    success_geo = await save_to_google_sheets(geo_payload, "мониторинг водителей")
+
+    res = [
+        "✅ <b>РЕЗУЛЬТАТЫ ПРОВЕРКИ:</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"1️⃣ <b>Таблица заявок:</b> {'ОК (11 колонок)' if success_order else '❌ ОШИБКА'}",
+        f"2️⃣ <b>Мониторинг GPS:</b> {'ОК (Запись в лог)' if success_geo else '❌ ОШИБКА'}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🕒 Время теста: {now}",
+        "\n<i>Если GPS '❌', создайте лист 'мониторинг водителей'</i>"
+    ]
+    await status_msg.edit_text("\n".join(res))
 
 @dp.message(Command("driver_2025"))
 async def cmd_driver(m: Message):
@@ -167,7 +214,7 @@ async def cmd_driver(m: Message):
     conn.execute("UPDATE users SET role='Водитель' WHERE user_id=?", (m.from_user.id,))
     conn.commit()
     conn.close()
-    await m.answer("✅ Роль водителя активирована!", reply_markup=get_main_kb(m.from_user.id))
+    await m.answer("✅ <b>Роль водителя активирована!</b>\nВам доступна кнопка отправки GPS.", reply_markup=get_main_kb(m.from_user.id))
 
 # =========================================================
 # 6. АНКЕТА (11 КОЛОНОК)
