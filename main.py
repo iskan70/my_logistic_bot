@@ -47,29 +47,27 @@ ADMIN_IDS = [494255577]
 SHEET_ID = os.getenv("SHEET_ID")
 
 # =========================================================
-# 2. СОСТОЯНИЯ (FSM)
+# 2. СОСТОЯНИЯ (FSM) — КАРКАС ДИАЛОГОВ
 # =========================================================
 class OrderFlow(StatesGroup):
-    fio = State()
-    phone = State()
-    cargo_type = State()
-    cargo_value = State()
-    origin = State()
-    destination = State()
-    weight = State()
-    volume = State()
+    fio = State()           # ФИО
+    phone = State()         # Номер
+    cargo_type = State()    # Тип груза
+    cargo_value = State()   # Стоимость $
+    origin = State()        # Откуда
+    destination = State()   # Куда
+    weight = State()        # Вес
+    volume = State()        # Объем
     waiting_for_doc_analysis = State()
 
 class CustomsCalc(StatesGroup):
-    cargo_name = State()
-    select_duty = State()
-    manual_duty = State()
-    cargo_price = State()
-    select_region = State()
+    cargo_name = State()    # Название для AI
+    select_duty = State()   # Выбор %
+    manual_duty = State()   # Свой %
+    cargo_price = State()   # Цена товара
 
 class Broadcast(StatesGroup):
     waiting_for_text = State()
-    waiting_for_retry = State()
 
 # =========================================================
 # 3. РАБОТА С ДАННЫМИ (DB & GOOGLE)
@@ -80,21 +78,12 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
         (user_id INTEGER PRIMARY KEY, username TEXT, role TEXT DEFAULT 'Клиент', 
         status TEXT, last_seen TEXT, last_geo TEXT, car_number TEXT, route TEXT, last_google_update TEXT)''')
-    
-    # Принудительное обновление колонок для старых баз
-    cols = [column[1] for column in cursor.execute("PRAGMA table_info(users)").fetchall()]
-    for col in ["car_number", "route", "last_google_update"]:
-        if col not in cols:
-            cursor.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
     conn.commit()
     conn.close()
 
 async def get_gs_client():
-    """Авторизация в Google Sheets через JSON из переменной окружения"""
     creds_json = os.getenv("GOOGLE_CREDS_JSON")
-    if not creds_json:
-        logging.error("GOOGLE_CREDS_JSON не найден в переменных окружения!")
-        return None
+    if not creds_json: return None
     info = json.loads(creds_json)
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
@@ -117,9 +106,7 @@ async def save_to_google_sheets(row_data: list, sheet_name=None):
 # =========================================================
 def get_main_kb(user_id: int):
     conn = sqlite3.connect('logistics.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
+    row = conn.execute("SELECT role FROM users WHERE user_id=?", (user_id,)).fetchone()
     role = row[0] if row else "Клиент"
     conn.close()
 
@@ -133,223 +120,208 @@ def get_main_kb(user_id: int):
 
 def get_country_kb():
     builder = InlineKeyboardBuilder()
-    countries = [("🇨🇳 Китай +86", "+86"), ("🇰🇿 Каз +7", "+7"), ("🇷🇺 Рос +7", "+7"), 
-                 ("🇧🇾 Бел +375", "+375"), ("🇺🇿 Узб +998", "+998"), ("🇪🇺 Европа +", "+")]
-    for name, code in countries:
-        builder.button(text=name, callback_data=f"country_{code}")
+    countries = [("🇨🇳 +86", "+86"), ("🇰🇿 +7", "+7"), ("🇷🇺 +7", "+7"), ("🇧🇾 +375", "+375"), ("🇺🇿 +998", "+998")]
+    for n, c in countries: builder.button(text=n, callback_data=f"country_{c}")
     return builder.adjust(2).as_markup()
 
-def get_region_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇷🇺 Россия (НДС 20%)", callback_data="vat_20")],
-        [InlineKeyboardButton(text="🇰🇿 Казахстан (НДС 12%)", callback_data="vat_12")]
-    ])
-
 # =========================================================
-# 5. КОМАНДЫ (START, ADMIN, DRIVER)
+# 5. КОМАНДЫ (START, ADMIN, DRIVER, DEMO)
 # =========================================================
 @dp.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
+    
+    # Регистрация или обновление пользователя в БД
     conn = sqlite3.connect('logistics.db')
-    conn.execute("INSERT INTO users (user_id, username, last_seen, status) VALUES (?, ?, ?, ?) "
-                 "ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen, status=excluded.status",
-                 (m.from_user.id, m.from_user.username, datetime.now().strftime("%d.%m.%Y %H:%M"), "В главном меню"))
+    conn.execute(
+        "INSERT INTO users (user_id, username, last_seen, status) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen, status=excluded.status",
+        (m.from_user.id, m.from_user.username, datetime.now().strftime("%d.%m.%Y %H:%M"), "Главное меню")
+    )
     conn.commit()
     conn.close()
     
-    welcome = (f"🤝 Здравствуйте, {m.from_user.first_name}!\n\n"
-        f"Вас приветствует логист компании Logistics Manager.\n\n"
+    welcome_text = (
+        f"🤝 Здравствуйте, {m.from_user.first_name}!\n\n"
+        f"Вас приветствует логист компании <b>Logistics Manager</b>.\n\n"
         f"Я помогу вам:\n"
         f"• Оформить заказ\n"
         f"• Рассчитать стоимость международной доставки\n"
         f"• Проверить коммерческие документы (AI-анализ)\n"
         f"• Оценить таможенные пошлины и налоги\n\n"
-        f"Воспользуйтесь меню ниже для начала работы 👇или напишите сообщение с вашим вопросом"
+        f"Воспользуйтесь меню ниже для начала работы 👇 или напишите в сообщении свой вопрос"
     )
+    
+    await m.answer(welcome_text, reply_markup=get_main_kb(m.from_user.id))
 
-    await m.answer(welcome, reply_markup=get_main_kb(m.from_user.id))
+@dp.message(Command("demo"))
+async def cmd_demo(m: Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    row = ["ДЕМО", now, m.from_user.full_name, "+7(000)", "Тест", "100$", "Китай", "Европа", "1кг", "1м3", "OK"]
+    if await save_to_google_sheets(row): await m.answer("✅ Тест 11 колонок в Google Sheets пройден!")
 
 @dp.message(Command("driver_2025"))
-async def cmd_driver_reg(m: Message):
+async def cmd_driver(m: Message):
     conn = sqlite3.connect('logistics.db')
     conn.execute("UPDATE users SET role='Водитель' WHERE user_id=?", (m.from_user.id,))
     conn.commit()
     conn.close()
-    await m.answer("✅ <b>Доступ водителя активирован!</b>\nТеперь вам доступна кнопка GPS.", reply_markup=get_main_kb(m.from_user.id))
-
-@dp.message(Command("admin"))
-async def cmd_admin(m: Message):
-    if m.from_user.id not in ADMIN_IDS: return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Статистика", callback_data="stats_users")],
-        [InlineKeyboardButton(text="🚛 Мониторинг", callback_data="stats_drivers")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="📂 Скачать базу", callback_data="download_base")]
-    ])
-    await m.answer("🛠 <b>Панель администратора:</b>", reply_markup=kb)
+    await m.answer("✅ Роль водителя активирована!", reply_markup=get_main_kb(m.from_user.id))
 
 # =========================================================
-# 6. АНКЕТА ПЕРЕВОЗКИ (11 КОЛОНОК)
+# 6. АНКЕТА (11 КОЛОНОК)
 # =========================================================
 @dp.message(F.text == "🚛 Оформить перевозку")
-async def order_init(m: Message, state: FSMContext):
+async def ord_1(m: Message, state: FSMContext):
     await state.set_state(OrderFlow.fio)
-    await m.answer("👤 Введите ваше <b>ФИО:</b>", reply_markup=ReplyKeyboardRemove())
+    await m.answer("👤 Введите ФИО:", reply_markup=ReplyKeyboardRemove())
 
 @dp.message(OrderFlow.fio)
-async def order_fio(m: Message, state: FSMContext):
+async def ord_2(m: Message, state: FSMContext):
     await state.update_data(fio=m.text)
     await state.set_state(OrderFlow.phone)
-    await m.answer("📱 Выберите код страны:", reply_markup=get_country_kb())
+    await m.answer("📱 Выберите код:", reply_markup=get_country_kb())
 
 @dp.callback_query(F.data.startswith("country_"), OrderFlow.phone)
-async def cb_phone_code(cb: CallbackQuery, state: FSMContext):
-    code = cb.data.split("_")[1]
-    digits = {"+86": 11, "+7": 10, "+375": 9, "+998": 9}.get(code, 10)
-    await state.update_data(temp_code=code, needed=digits)
-    await cb.message.answer(f"Введите оставшиеся <b>{digits}</b> цифр номера:")
+async def ord_3(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(p_code=cb.data.split("_")[1])
+    await cb.message.answer("Введите номер (без кода):")
     await cb.answer()
 
 @dp.message(OrderFlow.phone)
-async def order_phone_val(m: Message, state: FSMContext):
-    data = await state.get_data()
-    code, needed = data.get("temp_code"), data.get("needed")
-    clean = re.sub(r'\D', '', m.text)
-    
-    if code and len(clean) == needed:
-        await state.update_data(phone=code + clean)
-        await state.set_state(OrderFlow.cargo_type)
-        await m.answer("📦 <b>Что везем?</b> (Наименование):")
-    else:
-        await m.answer(f"⚠️ Нужно {needed} цифр. Попробуйте еще раз.")
+async def ord_4(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.update_data(phone=d['p_code'] + m.text)
+    await state.set_state(OrderFlow.cargo_type); await m.answer("📦 Что везем?")
 
 @dp.message(OrderFlow.cargo_type)
-async def order_type(m: Message, state: FSMContext):
-    await state.update_data(cargo_type=m.text)
-    await state.set_state(OrderFlow.cargo_value)
-    await m.answer("💰 <b>Инвойсная стоимость</b> (USD):")
+async def ord_5(m: Message, state: FSMContext):
+    await state.update_data(cargo=m.text); await state.set_state(OrderFlow.cargo_value)
+    await m.answer("💰 Стоимость ($):")
 
 @dp.message(OrderFlow.cargo_value)
-async def order_val(m: Message, state: FSMContext):
-    await state.update_data(cargo_value=m.text)
-    await state.set_state(OrderFlow.origin)
-    await m.answer("📍 <b>Пункт отправления:</b>")
+async def ord_6(m: Message, state: FSMContext):
+    await state.update_data(val=m.text); await state.set_state(OrderFlow.origin)
+    await m.answer("📍 Откуда?")
 
 @dp.message(OrderFlow.origin)
-async def order_org(m: Message, state: FSMContext):
-    await state.update_data(org=m.text)
-    await state.set_state(OrderFlow.destination)
-    await m.answer("🏁 <b>Пункт назначения:</b>")
+async def ord_7(m: Message, state: FSMContext):
+    await state.update_data(org=m.text); await state.set_state(OrderFlow.destination)
+    await m.answer("🏁 Куда?")
 
 @dp.message(OrderFlow.destination)
-async def order_dst(m: Message, state: FSMContext):
-    await state.update_data(dst=m.text)
-    await state.set_state(OrderFlow.weight)
-    await m.answer("⚖️ Общий <b>вес</b> (кг):")
+async def ord_8(m: Message, state: FSMContext):
+    await state.update_data(dst=m.text); await state.set_state(OrderFlow.weight)
+    await m.answer("⚖️ Вес (кг):")
 
 @dp.message(OrderFlow.weight)
-async def order_w(m: Message, state: FSMContext):
-    await state.update_data(weight=m.text)
-    await state.set_state(OrderFlow.volume)
-    await m.answer("📐 Общий <b>объем</b> (м³):")
+async def ord_9(m: Message, state: FSMContext):
+    await state.update_data(w=m.text); await state.set_state(OrderFlow.volume)
+    await m.answer("📐 Объем (м³):")
 
 @dp.message(OrderFlow.volume)
-async def order_finish(m: Message, state: FSMContext):
-    await state.update_data(volume=m.text)
+async def ord_10(m: Message, state: FSMContext):
     d = await state.get_data()
-    row = [
-        "ЗАКАЗ", datetime.now().strftime("%d.%m.%Y %H:%M"),
-        d.get('fio'), d.get('phone'), d.get('cargo_type'), d.get('cargo_value'),
-        d.get('org'), d.get('dst'), d.get('weight'), d.get('volume'), "-"
-    ]
-    await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
-    success = await save_to_google_sheets(row)
-    text = "🚀 <b>Заявка принята!</b> Менеджер скоро свяжется с вами." if success else "✅ Заявка сохранена!"
-    await m.answer(text, reply_markup=get_main_kb(m.from_user.id))
+    row = ["ЗАКАЗ", datetime.now().strftime("%d.%m.%Y %H:%M"), d['fio'], d['phone'], d['cargo'], d['val'], d['org'], d['dst'], d['w'], m.text, "Срок 18д"]
+    await save_to_google_sheets(row)
+    await m.answer("🚀 Заявка в таблице! Менеджер свяжется.", reply_markup=get_main_kb(m.from_user.id))
     await state.clear()
 
 # =========================================================
-# 7. VISION AI: АНАЛИЗ ДОКУМЕНТОВ (Base64)
+# 7. VISION AI (Base64)
 # =========================================================
 @dp.message(F.text == "📄 Анализ документов")
-async def doc_init(m: Message, state: FSMContext):
+async def vis_1(m: Message, state: FSMContext):
     await state.set_state(OrderFlow.waiting_for_doc_analysis)
-    await m.answer("📂 Пришлите ФОТО документа. Я проанализирую данные через AI.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Назад")]], resize_keyboard=True))
+    await m.answer("📸 Пришлите фото документа:")
 
 @dp.message(OrderFlow.waiting_for_doc_analysis, F.photo)
-async def handle_doc_ai(m: Message, state: FSMContext):
-    await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+async def vis_2(m: Message, state: FSMContext):
+    await m.answer("⌛ Анализирую...")
+    file = await bot.get_file(m.photo[-1].file_id)
+    p_bytes = await bot.download_file(file.file_path)
+    b64 = base64.b64encode(p_bytes.getvalue()).decode()
     
-    # Загрузка и конвертация в Base64 для надежности
-    file_info = await bot.get_file(m.photo[-1].file_id)
-    photo_bytes = await bot.download_file(file_info.file_path)
-    base64_image = base64.b64encode(photo_bytes.getvalue()).decode('utf-8')
-
-    prompt = "Ты эксперт Logistics Manager. Проанализируй фото документа и выдай: 1. Отправитель, 2. Получатель, 3. Товар, 4. Вес, 5. Цена. На русском."
-    
-    try:
-        response = await client_ai.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                ]
-            }]
-        )
-        report = response.choices[0].message.content
-        await m.answer(f"📊 <b>РЕЗЮМЕ AI:</b>\n\n{report}", reply_markup=get_main_kb(m.from_user.id))
-        
-        row = ["AI_АНАЛИЗ", datetime.now().strftime("%d.%m.%Y %H:%M"), m.from_user.full_name, "-", "-", "-", "-", "-", "-", "-", report]
-        await save_to_google_sheets(row)
-    except Exception as e:
-        logging.error(f"Vision Error: {e}")
-        await m.answer("⚠️ Ошибка анализа. Попробуйте еще раз.")
+    res = await client_ai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": [{"type": "text", "text": "Выпиши Отправителя, Товар и Вес."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}] )
+    await m.answer(f"📊 AI Резюме:\n{res.choices[0].message.content}", reply_markup=get_main_kb(m.from_user.id))
     await state.clear()
 
 # =========================================================
-# 8. ТАМОЖЕННЫЙ КАЛЬКУЛЯТОР
+# 8. ТАМОЖЕННЫЙ КАЛЬКУЛЯТОР (ПОШЛИНЫ И ТН ВЭД)
 # =========================================================
+
 @dp.message(F.text == "🛡 Таможня")
 async def cust_init(m: Message, state: FSMContext):
     await state.set_state(CustomsCalc.cargo_name)
-    await m.answer("🔍 Введите название товара:")
+    await m.answer("🔍 Введите название товара (например: 'Литиевые аккумуляторы'):")
 
 @dp.message(CustomsCalc.cargo_name)
 async def cust_ai_tip(m: Message, state: FSMContext):
     await state.update_data(c_name=m.text)
+    # Быстрая подсказка от AI по коду ТН ВЭД
     res = await client_ai.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": "Назови только код ТН ВЭД и ставку %."}, {"role": "user", "content": m.text}]
+        messages=[{"role": "system", "content": "Назови только вероятный код ТН ВЭД и ставку пошлины %."}, {"role": "user", "content": m.text}]
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="5%", callback_data="setduty_5"), InlineKeyboardButton(text="10%", callback_data="setduty_10")],
-        [InlineKeyboardButton(text="Свой %", callback_data="setduty_manual")]
+        [InlineKeyboardButton(text="15%", callback_data="setduty_15"), InlineKeyboardButton(text="Свой %", callback_data="setduty_manual")]
     ])
-    await m.answer(f"💡 Подсказка AI: {res.choices[0].message.content}\nВыберите ставку:", reply_markup=kb)
+    await m.answer(f"💡 <b>Справка AI:</b> {res.choices[0].message.content}\n\nВыберите или введите ставку пошлины для расчета:", reply_markup=kb)
     await state.set_state(CustomsCalc.select_duty)
 
 @dp.callback_query(F.data.startswith("setduty_"), CustomsCalc.select_duty)
-async def cust_set(cb: CallbackQuery, state: FSMContext):
-    if cb.data == "setduty_manual":
-        await cb.message.answer("Введите число %:")
+async def cust_set_duty_choice(cb: CallbackQuery, state: FSMContext):
+    """Обработка выбора процента пошлины"""
+    action = cb.data.split("_")[1]
+    
+    if action == "manual":
+        await cb.message.answer("Введите число процентов пошлины (только цифры):")
         await state.set_state(CustomsCalc.manual_duty)
     else:
-        await state.update_data(duty=float(cb.data.split("_")[1]))
-        await cb.message.answer("💰 Стоимость товара (USD):")
+        await state.update_data(duty=float(action))
+        await cb.message.answer("💰 Введите инвойсную стоимость товара ($):")
         await state.set_state(CustomsCalc.cargo_price)
     await cb.answer()
 
+@dp.message(CustomsCalc.manual_duty)
+async def cust_manual_duty_val(m: Message, state: FSMContext):
+    """Прием ручного ввода процента"""
+    try:
+        val = float(m.text.replace(",", "."))
+        await state.update_data(duty=val)
+        await m.answer("💰 Теперь введите инвойсную стоимость товара ($):")
+        await state.set_state(CustomsCalc.cargo_price)
+    except:
+        await m.answer("⚠️ Пожалуйста, введите число.")
+
 @dp.message(CustomsCalc.cargo_price)
-async def cust_final(m: Message, state: FSMContext):
+async def cust_final_calc(m: Message, state: FSMContext):
     data = await state.get_data()
-    price = float(m.text.replace(",", "."))
-    duty_p = data['duty']
-    duty_v = price * (duty_p / 100)
-    total = duty_v + (price + duty_v) * 0.2  # Пример НДС 20%
-    await m.answer(f"📊 <b>Расчет:</b>\nПошлина: ${duty_v:.2f}\nИтого с НДС (ориентир): ${total:.2f}")
+    try:
+        price = float(m.text.replace(",", "."))
+        duty_p = data['duty']
+        
+        # Формула: Пошлина + НДС (начисляется на сумму цены и пошлины)
+        duty_v = price * (duty_p / 100)
+        vat_v = (price + duty_v) * 0.20 # Стандарт НДС 20%
+        total_taxes = duty_v + vat_v
+        
+        res = (f"📊 <b>ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ:</b>\n"
+               f"━━━━━━━━━━━━━━━━━━\n"
+               f"📦 Товар: {data.get('c_name', 'Не указан')}\n"
+               f"💵 Стоимость: ${price:,.2f}\n"
+               f"⚖️ Пошлина ({duty_p}%): ${duty_v:,.2f}\n"
+               f"🏦 НДС (20%): ${vat_v:,.2f}\n"
+               f"━━━━━━━━━━━━━━━━━━\n"
+               f"💰 <b>ИТОГО ТАМОЖНЯ: ${total_taxes:,.2f}</b>\n\n"
+               f"<i>*Расчет носит ознакомительный характер.</i>")
+        
+        await m.answer(res, reply_markup=get_main_kb(m.from_user.id))
+    except Exception as e:
+        logging.error(f"Calc error: {e}")
+        await m.answer("⚠️ Ошибка: Введите только число (цену).")
     await state.clear()
 
 # =========================================================
@@ -359,18 +331,21 @@ async def cust_final(m: Message, state: FSMContext):
 async def handle_manual_geo(m: Message):
     lat, lon = m.location.latitude, m.location.longitude
     geo = f"{lat},{lon}"
+    # Генерируем прямую ссылку на точку
     map_url = f"https://www.google.com/maps?q={geo}"
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     
     conn = sqlite3.connect('logistics.db')
-    u = conn.execute("SELECT username, car_number, route FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
+    # Добавляем IFNULL, чтобы код не падал, если данных нет
+    u = conn.execute("SELECT username, IFNULL(car_number, '-'), IFNULL(route, '-') FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
     conn.execute("UPDATE users SET last_geo=?, last_seen=? WHERE user_id=?", (geo, now, m.from_user.id))
     conn.commit()
     conn.close()
 
-    row = [u[0] or m.from_user.full_name, u[1] or "-", u[2] or "-", now, geo, map_url, "🚀 Начал рейс"]
+    row = [u[0] or m.from_user.full_name, u[1], u[2], now, geo, map_url, "🚀 Начал рейс"]
+    # Пишем в отдельный лист Google
     await save_to_google_sheets(row, "мониторинг водителей")
-    await m.answer("✅ <b>Рейс запущен!</b> GPS транслируется.")
+    await m.answer("✅ <b>Рейс запущен!</b>\nВаш GPS-сигнал транслируется в таблицу.")
 
 @dp.edited_message(F.location)
 async def handle_live_geo(m: Message):
@@ -381,12 +356,15 @@ async def handle_live_geo(m: Message):
     conn = sqlite3.connect('logistics.db')
     u = conn.execute("SELECT username, car_number, route, last_google_update FROM users WHERE user_id=?", (user_id,)).fetchone()
     
-    # Ограничение 3 часа для записи в Google Sheets
+    # Ограничение 3 часа для записи в Google Sheets (чтобы не спамить API)
     should_update_gs = True
     if u and u[3]:
-        last_dt = datetime.strptime(u[3], "%d.%m.%Y %H:%M")
-        if (now - last_dt).total_seconds() < 10800:
-            should_update_gs = False
+        try:
+            last_dt = datetime.strptime(u[3], "%d.%m.%Y %H:%M")
+            if (now - last_dt).total_seconds() < 10800:
+                should_update_gs = False
+        except:
+            should_update_gs = True
 
     if should_update_gs:
         map_url = f"https://www.google.com/maps?q={geo}"
@@ -403,31 +381,54 @@ async def handle_live_geo(m: Message):
 # =========================================================
 @dp.callback_query(F.data == "stats_users")
 async def cb_stats(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS: return
+    
     conn = sqlite3.connect('logistics.db')
+    # Более мощный запрос: общее кол-во и список последних 5 имен
     total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    recent = conn.execute("SELECT username FROM users ORDER BY last_seen DESC LIMIT 5").fetchall()
     conn.close()
-    await cb.message.answer(f"📊 Всего пользователей: <b>{total}</b>")
+    
+    names = ", ".join([f"@{r[0]}" for r in recent if r[0]])
+    res = (f"📊 <b>СТАТИСТИКА БАЗЫ</b>\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"👥 Всего пользователей: <b>{total}</b>\n"
+           f"🕒 Последние в сети: <i>{names}</i>")
+    
+    await cb.message.answer(res)
     await cb.answer()
 
 @dp.message(F.text & ~F.state())
 async def ai_consultant(m: Message):
-    if m.text in ["🚛 Оформить перевозку", "🛡 Таможня", "📄 Анализ документов", "👨‍💼 Менеджер"]: return
+    # Если это кнопка меню — не отвечаем как AI
+    if m.text in ["🚛 Оформить перевозку", "🛡 Таможня", "📄 Анализ документов", "👨‍💼 Менеджер"]: 
+        return
+        
     await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+    # Используем твой фирменный промпт
     res = await client_ai.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": "Ты эксперт Logistics Manager. Доставка из Китая в Европу 18 дней, низкие цены. Предлагай нажать 'Оформить перевозку'."}, 
-                  {"role": "user", "content": m.text}]
+        messages=[
+            {"role": "system", "content": "Ты эксперт Logistics Manager. Доставка из Китая в Европу 18 дней, низкие цены. Предлагай нажать 'Оформить перевозку'."}, 
+            {"role": "user", "content": m.text}
+        ]
     )
     await m.answer(f"🏢 <b>Logistics Manager:</b>\n\n{res.choices[0].message.content}")
 
 # =========================================================
-# ЗАПУСК
+# ЗАПУСК БОТА
 # =========================================================
 async def main():
     init_db()
-    print("🚀 Бот Logistics Manager запущен...")
+    print("✅ База данных готова")
+    print("🚀 Бот Logistics Manager запущен и ожидает сообщений...")
+    
+    # Сброс вебхуков и запуск пуллинга
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("🛑 Бот остановлен")
